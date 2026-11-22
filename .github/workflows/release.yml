@@ -1,0 +1,58 @@
+name: Build and Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to create or attach to (e.g. v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.release_tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup firmware build environment
+        run: sh fw/setup.sh
+
+      - name: Build release firmware binary
+        run: make -C fw release
+
+      - name: Verify release binary exists
+        run: test -s fw/build/release/v90d-ht802fw.bin
+
+      - name: Upload firmware build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: v90d-ht802fw-bin
+          path: fw/build/release/v90d-ht802fw.bin
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: fw/build/release/v90d-ht802fw.bin
+          generate_release_notes: true
