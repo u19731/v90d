@@ -20,12 +20,26 @@ enum { R_CFG = 0x000, R_STS = 0x008, R_ISR = 0x00C, R_IER = 0x010, R_ICR = 0x014
 #define CMD_WRDI    (0x04ul | (9ul << 8))
 #define CMD_QPI     (0x38ul | (9ul << 8))
 #define CMD_SE      (0x20ul | (0ul << 8))
+#define CMD_OUT     (1ul << 14)             /* the data phase is a write */
+/* chip bring-up commands, single line until QPI is on (refs/qspi-chips.md) */
+#define CMD_RDSR2   (0x35ul | (5ul << 8) | CMD_IN)      /* read status register 2 */
+#define CMD_WRSR2   (0x31ul | (6ul << 8) | CMD_OUT)     /* write status register 2 */
+#define CMD_VWREN   (0x50ul | (9ul << 8))               /* volatile status write enable (Winbond) */
+#define CMD_SETRD   (0xC0ul | (9ul << 8) | CMD_OUT)     /* Winbond set read parameters (in QPI) */
+#define QE_SR2      0x02u                                /* quad enable: bit 1 of status register 2 */
+/* Micron N25Q: quad and dummy live in the (enhanced) volatile config registers */
+#define CMD_WRSR    (0x01ul | (6ul << 8) | CMD_OUT)
+#define CMD_RDVCR   (0x85ul | (5ul << 8) | CMD_IN)
+#define CMD_WRVCR   (0x81ul | (6ul << 8) | CMD_OUT)
+#define CMD_RDEVCR  (0x65ul | (5ul << 8) | CMD_IN)
+#define CMD_WREVCR  (0x61ul | (6ul << 8) | CMD_OUT)
 #define SR_BUSY     0x01u
 #define SR_WEL      0x02u
 /* the values the unit's own software runs the chip with (read from it) */
 #define V_CFG       0x00010009ul
 #define V_CSTIMING  0x00000300ul
-#define V_RDTRSTP   0x0008362Aul        /* fast read 0x0B, all on four lines */
+#define V_RDTRSTP   0x0008362Aul        /* fast read 0x0B, all on four lines, 6 dummy clocks */
+#define V_RDTRSTP_GD 0x0008262Aul       /* same, 4 dummy clocks (GD25Q128) */
 #define V_RDCMD     0x0000000Bul
 #define V_PPTRSTP   0x0008048Aul        /* page program 0x02, all on four lines */
 #define V_PPCMD     0x00000002ul
@@ -69,12 +83,61 @@ static int aux(qspi_t *q, uint32_t lines, uint32_t cmd, int with_addr, uint32_t 
     return QSPI_OK;
 }
 
-static int is_our_chip(qspi_t *q, uint32_t lines, int *yes)
+/* a register-driven command that writes up to 32 octets out; the FIFO is
+ * filled from the end, the way the read path (aux) reads it */
+static int aux_out(qspi_t *q, uint32_t lines, uint32_t cmd, const uint8_t *out, unsigned n)
+{
+    uint32_t w[8];
+    unsigned i;
+    for (i = 0; i < 8; i++) w[i] = 0;
+    for (i = 0; i < n; i++) { unsigned at = 31 - i; w[at >> 2] |= (uint32_t)out[i] << (8 * (at & 3)); }
+    for (i = 0; ; i++) {
+        uint32_t s = RD(q, R_STS);
+        if (!(s & STS_BUSY) && (s & STS_IDLE)) break;
+        if (i >= IDLE_POLLS) return QSPI_E_TIMEOUT;
+        q->io.udelay(q->io.ctx, 10);
+    }
+    for (i = 0; i < 8; i++) WR(q, R_FWD + i * 4, w[i]);
+    WR(q, R_TRSTP, lines | TR_HAS_OP | ((uint32_t)n << 20));
+    WR(q, R_CMD, cmd | CMD_START);
+    for (i = 0; !(RD(q, R_ISR) & INT_DONE); i++) {
+        if (i >= IDLE_POLLS) return QSPI_E_TIMEOUT;
+        q->io.udelay(q->io.ctx, 10);
+    }
+    WR(q, R_ICR, INT_DONE);
+    for (i = 0; RD(q, R_ISR) & INT_DONE; i++) {
+        if (i >= IDLE_POLLS) return QSPI_E_TIMEOUT;
+        q->io.udelay(q->io.ctx, 10);
+    }
+    WR(q, R_ICR, 0);
+    return QSPI_OK;
+}
+
+/* the chips we know, by JEDEC id; all 16 MiB, read 0x0B in QPI (refs/qspi-chips.md) */
+static const struct { uint8_t id[3]; int chip; uint32_t rdtrstp; } CHIPS[] = {
+    { { 0x1C, 0x71, 0x18 }, QSPI_CHIP_EON,     V_RDTRSTP },     /* EN25QX128A */
+    { { 0xEF, 0x40, 0x18 }, QSPI_CHIP_WINBOND, V_RDTRSTP },     /* W25Q128FV */
+    { { 0xEF, 0x60, 0x18 }, QSPI_CHIP_WINBOND, V_RDTRSTP },     /* W25Q128FV (QPI id) */
+    { { 0xC8, 0x40, 0x18 }, QSPI_CHIP_GD,      V_RDTRSTP_GD },  /* GD25Q128 */
+    { { 0x20, 0xBA, 0x18 }, QSPI_CHIP_N25Q,    V_RDTRSTP }      /* N25Q128A */
+};
+
+/* read the JEDEC id on `lines` and set q->chip / q->rdtrstp; QSPI_CHIP_NONE
+ * when we do not know it (not an error: the caller may be asking in the mode
+ * the chip is not in) */
+static int identify(qspi_t *q, uint32_t lines)
 {
     uint8_t id[3];
+    unsigned i;
     int r = aux(q, lines, CMD_RDID, 0, 0, id, 3);
-    *yes = r == QSPI_OK && id[0] == 0x1C && id[1] == 0x71 && id[2] == 0x18;     /* EN25QX128A */
-    return r;
+    if (r != QSPI_OK) return r;
+    for (i = 0; i < sizeof CHIPS / sizeof CHIPS[0]; i++)
+        if (id[0] == CHIPS[i].id[0] && id[1] == CHIPS[i].id[1] && id[2] == CHIPS[i].id[2]) {
+            q->chip = CHIPS[i].chip; q->rdtrstp = CHIPS[i].rdtrstp;
+            return QSPI_OK;
+        }
+    q->chip = QSPI_CHIP_NONE;
+    return QSPI_OK;
 }
 
 /* wait until the status register, under mask, reads want */
@@ -104,26 +167,88 @@ static void controller_setup(qspi_t *q)
     WR(q, R_IER, 0);                    /* polled */
     WR(q, R_CFG, V_CFG);
     WR(q, R_CSTIMING, V_CSTIMING);
-    WR(q, R_RDTRSTP, V_RDTRSTP); WR(q, R_RDCMD, V_RDCMD);
+    WR(q, R_RDTRSTP, q->rdtrstp); WR(q, R_RDCMD, V_RDCMD);
     WR(q, R_PPTRSTP, V_PPTRSTP); WR(q, R_PPCMD, V_PPCMD);
     WR(q, R_MEMADD, V_MEMADD);
 }
 
+/* poll the status register on one line until the chip is not busy */
+static int wait_ready_single(qspi_t *q)
+{
+    unsigned i;
+    for (i = 0; ; i++) {
+        uint8_t s;
+        int r = aux(q, TR_SINGLE, CMD_RDSR, 0, 0, &s, 1);
+        if (r != QSPI_OK) return r;
+        if (!(s & SR_BUSY)) return QSPI_OK;
+        if (i >= CHIP_POLLS) return QSPI_E_TIMEOUT;
+        q->io.udelay(q->io.ctx, 100);
+    }
+}
+
+/* put the identified chip into QPI with window reads. The chip is on one
+ * line here; the sequence is this chip's (refs/qspi-chips.md). */
+static int chip_enable(qspi_t *q)
+{
+    uint8_t v;
+    int r;
+    switch (q->chip) {
+    case QSPI_CHIP_EON:
+        /* the 0x38 command alone switches it; no quad-enable bit */
+        return aux(q, TR_SINGLE, CMD_QPI, 0, 0, 0, 0);
+    case QSPI_CHIP_WINBOND:
+        if ((r = aux(q, TR_SINGLE, CMD_RDSR2, 0, 0, &v, 1)) != QSPI_OK) return r;
+        v |= QE_SR2;
+        if ((r = aux(q, TR_SINGLE, CMD_VWREN, 0, 0, 0, 0)) != QSPI_OK) return r;
+        if ((r = aux_out(q, TR_SINGLE, CMD_WRSR2, &v, 1)) != QSPI_OK) return r;
+        if ((r = aux(q, TR_SINGLE, CMD_QPI, 0, 0, 0, 0)) != QSPI_OK) return r;
+        v = 0x2u << 4;                          /* 6 dummy clocks, set once in QPI */
+        return aux_out(q, TR_QUAD, CMD_SETRD, &v, 1);
+    case QSPI_CHIP_GD:
+        if ((r = aux(q, TR_SINGLE, CMD_RDSR2, 0, 0, &v, 1)) != QSPI_OK) return r;
+        if (!(v & QE_SR2)) {
+            if ((r = aux(q, TR_SINGLE, CMD_WREN, 0, 0, 0, 0)) != QSPI_OK) return r;
+            v = QE_SR2;
+            if ((r = aux_out(q, TR_SINGLE, CMD_WRSR2, &v, 1)) != QSPI_OK) return r;
+            if ((r = wait_ready_single(q)) != QSPI_OK) return r;
+        }
+        return aux(q, TR_SINGLE, CMD_QPI, 0, 0, 0, 0);
+    case QSPI_CHIP_N25Q:
+        if ((r = aux(q, TR_SINGLE, CMD_RDSR, 0, 0, &v, 1)) != QSPI_OK) return r;
+        v = (uint8_t)(v & ~0x5Cu);              /* clear block protection */
+        if ((r = aux(q, TR_SINGLE, CMD_WREN, 0, 0, 0, 0)) != QSPI_OK) return r;
+        if ((r = aux_out(q, TR_SINGLE, CMD_WRSR, &v, 1)) != QSPI_OK) return r;
+        if ((r = wait_ready_single(q)) != QSPI_OK) return r;
+        if ((r = aux(q, TR_SINGLE, CMD_RDVCR, 0, 0, &v, 1)) != QSPI_OK) return r;
+        v = (uint8_t)((v & ~0xF0u) | (6u << 4));    /* 6 dummy clocks */
+        if ((r = aux(q, TR_SINGLE, CMD_WREN, 0, 0, 0, 0)) != QSPI_OK) return r;
+        if ((r = aux_out(q, TR_SINGLE, CMD_WRVCR, &v, 1)) != QSPI_OK) return r;
+        if ((r = wait_ready_single(q)) != QSPI_OK) return r;
+        if ((r = aux(q, TR_SINGLE, CMD_RDEVCR, 0, 0, &v, 1)) != QSPI_OK) return r;
+        v = (uint8_t)((v & ~(1u << 7)) | (1u << 6));  /* quad on (bit 7 = 0), dual off (bit 6 = 1): now QPI */
+        if ((r = aux(q, TR_SINGLE, CMD_WREN, 0, 0, 0, 0)) != QSPI_OK) return r;
+        return aux_out(q, TR_SINGLE, CMD_WREVCR, &v, 1);
+    }
+    return QSPI_E_ID;
+}
+
 int qspi_init(qspi_t *q, const qspi_io *io)
 {
-    int r, yes;
+    int r;
     q->io = *io; q->ready = 0; q->nallow = 0; q->retries = 0;
+    q->chip = QSPI_CHIP_NONE; q->rdtrstp = V_RDTRSTP;   /* defaults until identified */
     controller_setup(q);
     /* After U-Boot the chip listens on one line; after the stock system (a
-     * RAM boot) on four. Asking in the wrong mode is heard as noise. */
-    if ((r = is_our_chip(q, TR_SINGLE, &yes)) != QSPI_OK) return r;
-    if (yes) {
-        /* this part needs no enable bit for four-line operation: the
-         * command alone switches it */
-        if ((r = aux(q, TR_SINGLE, CMD_QPI, 0, 0, 0, 0)) != QSPI_OK) return r;
-    }
-    if ((r = is_our_chip(q, TR_QUAD, &yes)) != QSPI_OK) return r;
-    if (!yes) return QSPI_E_ID;
+     * RAM boot) on four. Ask on one line first and, if we know it, turn on
+     * QPI the way that chip needs. If the one-line id is unknown the chip may
+     * already be in QPI from a stock RAM boot: the four-line id below catches
+     * that (aux reads the id whatever the window read shape is). */
+    if ((r = identify(q, TR_SINGLE)) != QSPI_OK) return r;
+    if (q->chip != QSPI_CHIP_NONE)
+        if ((r = chip_enable(q)) != QSPI_OK) return r;
+    if ((r = identify(q, TR_QUAD)) != QSPI_OK) return r;
+    if (q->chip == QSPI_CHIP_NONE) return QSPI_E_ID;
+    controller_setup(q);        /* apply this chip's read shape for window reads */
     q->ready = 1;
     return QSPI_OK;
 }

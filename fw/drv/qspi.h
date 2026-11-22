@@ -41,9 +41,22 @@ typedef struct {
     void     *ctx;
 } qspi_io;
 
+/* the flash chip families the controller is set up for (refs/qspi-chips.md).
+ * All are 16 MiB and read with opcode 0x0B in QPI; they differ in how quad
+ * mode is turned on and in the read dummy length. */
+enum {
+    QSPI_CHIP_NONE = 0,
+    QSPI_CHIP_EON,              /* EN25QX128A: QPI by the 0x38 command alone */
+    QSPI_CHIP_WINBOND,          /* W25Q128FV: quad-enable in SR2, then 0x38, then set read params */
+    QSPI_CHIP_GD,               /* GD25Q128: quad-enable in SR2, then 0x38 */
+    QSPI_CHIP_N25Q              /* Micron N25Q128: quad and dummy in the (enhanced) volatile config registers */
+};
+
 typedef struct {
     qspi_io  io;
     int      ready;
+    int      chip;              /* QSPI_CHIP_*, found by qspi_init */
+    uint32_t rdtrstp;           /* the window read shape for this chip (dummy length differs) */
     unsigned nallow;
     struct { uint32_t lo, hi; } allow[QSPI_MAX_ALLOW];
     unsigned long retries;      /* page programs done again after a failed check */

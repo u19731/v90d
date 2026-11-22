@@ -13,6 +13,8 @@ typedef struct {
     int      busy_polls;        /* status says busy for this many reads after erase/program */
     int      busy;
     uint8_t  id[3];
+    int      need_qe;           /* Winbond/GD: 0x38 enters QPI only once the QE bit (SR2 bit 1) is set */
+    uint8_t  sr2;               /* status register 2 (the QE bit lives here) */
     int      stuck;             /* controller never idle */
     int      cut_bursts;        /* this many page programs end after the first word */
     int      lost_bursts;       /* this many are not taken at all: write enable stays set,

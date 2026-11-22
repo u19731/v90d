@@ -50,7 +50,10 @@ static uint8_t xfer(void *ctx, uint8_t out)
     c->frames++;
     switch (c->phase) {
     case 0:
-        if ((out & 0x3F) != 0x20) c->bad++;             /* register access, channel 0 */
+        /* register access, channel 0 (0x20/0x60) or channel 1 (0x30/0x70):
+         * bit 6 = read, bit 4 = CID, the rest fixed */
+        if ((out & 0xAF) != 0x20) c->bad++;
+        c->ch = (out >> 4) & 1;
         c->ctl = out; c->phase = 1; break;
     case 1:
         if (out > 127) c->bad++;

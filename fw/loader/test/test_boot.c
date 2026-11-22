@@ -184,16 +184,28 @@ static void test_other_hardware(void)
     ld_run(&E, &R); CHECK_EQ_I(R.action, LD_BOOT); CHECK_EQ_I(R.size, 50000);
     fresh(); install(0, 50000, 7); memcpy(S.mem + LD_BOARD_OFF, "9610003611C", 12); keep();
     ld_run(&E, &R); CHECK_EQ_I(R.action, LD_BOOT); CHECK_EQ_I(R.size, 50000);
+    /* a Winbond W25Q128FV flash (issue #4's HT802 V1.6A, board 9610003716A):
+     * the loader must set the quad-enable bit and enter QPI itself, then boot */
+    fresh(); install(0, 50000, 7); memcpy(S.mem + LD_BOARD_OFF, "9610003716A", 12);
+    S.id[0] = 0xEF; S.id[1] = 0x40; S.id[2] = 0x18; S.need_qe = 1; S.sr2 = 0; keep();
+    ld_run(&E, &R);
+    CHECK_EQ_I(R.action, LD_BOOT); CHECK_EQ_I(R.size, 50000); CHECK_EQ_I((int)S.bad, 0);
+    CHECK_EQ_I(S.qpi, 1); CHECK_EQ_I((S.sr2 & 0x02) != 0, 1);
+    /* a GigaDevice GD25Q128 flash (also quad-enabled in SR2): boots too */
+    fresh(); install(0, 50000, 7); memcpy(S.mem + LD_BOARD_OFF, "9610003716A", 12);
+    S.id[0] = 0xC8; S.id[1] = 0x40; S.id[2] = 0x18; S.need_qe = 1; S.sr2 = 0; keep();
+    ld_run(&E, &R);
+    CHECK_EQ_I(R.action, LD_BOOT); CHECK_EQ_I(R.size, 50000); CHECK_EQ_I((int)S.bad, 0);
     /* a flash chip the driver does not know: it stays in single-line mode,
      * our header's sector is erased with plain commands, nothing else */
-    fresh(); install(1, 50000, 7); E.fdt = fdt_b; S.id[0] = 0xC8; S.id[1] = 0x40; keep();
+    fresh(); install(1, 50000, 7); E.fdt = fdt_b; S.id[0] = 0xC2; S.id[1] = 0x20; keep();   /* Macronix: a chip we do not carry */
     ld_run(&E, &R);
     CHECK_EQ_I(R.action, LD_RESET); CHECK_EQ_I(R.why, LD_W_FLASH);
     CHECK_EQ_I((int)S.erases, 1); CHECK_EQ_I(S.last_erase == LD_CORE_B, 1); CHECK_EQ_I(S.qpi, 0);
     CHECK_EQ_I(word(LD_CORE_B) == 0xFFFFFFFFul, 1);
     CHECK(untouched_outside(LD_CORE_B, LD_CORE_B + 0x1000)); CHECK_EQ_I((int)S.bad, 0);
     /* the same, but nothing says which set we are: hands off */
-    fresh(); install(1, 50000, 7); E.fdt = 0; S.id[0] = 0xC8; S.id[1] = 0x40; keep();
+    fresh(); install(1, 50000, 7); E.fdt = 0; S.id[0] = 0xC2; S.id[1] = 0x20; keep();   /* Macronix: a chip we do not carry */
     ld_run(&E, &R);
     CHECK_EQ_I(R.action, LD_RESET); CHECK_EQ_I(R.why, LD_W_FLASH); CHECK(untouched_outside(0, 0));
     /* a controller that never answers ends in a reset, not a hang */

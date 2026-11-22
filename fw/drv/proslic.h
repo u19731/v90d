@@ -20,6 +20,11 @@ typedef struct {
     uint8_t (*xfer)(void *ctx, uint8_t out);
     void    (*msleep)(void *ctx, unsigned ms);
     void    *ctx;
+    /* which channel of the part this bus talks to: 0, or 1 for the second
+     * channel of a dual part (Si3226x) that shares one chip select. It goes
+     * into the SPI control octet as the CID; 0 for the single-channel parts.
+     * A zeroed ps_bus is channel 0, so existing callers need no change. */
+    uint8_t  cid;
 } ps_bus;
 
 /* direct registers 0..127 */

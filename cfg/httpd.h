@@ -175,6 +175,7 @@ typedef struct httpd {
     const status_t *status2;        /* port 2, or NULL */
     int           (*save)(void *ctx, const cfg_t *newcfg);
     int           (*vpn)(void *ctx, const char *profile, size_t len); void *vpn_ctx;
+    int           (*diag)(void *ctx, char *buf, size_t cap); void *diag_ctx;    /* GET /log */
     status_bbs_rows bbs; void *bbs_ctx;
     const char *bbs_query; size_t bbs_qlen;     /* of the request being answered */
     void           *save_ctx;
@@ -230,6 +231,12 @@ void httpd_on_save(httpd_t *h, int (*save)(void *ctx, const cfg_t *newcfg), void
 /* The BBS page's boards (status.h, status_render_bbs); NULL = no list. */
 void httpd_on_bbs(httpd_t *h, status_bbs_rows rows, void *ctx);
 void httpd_on_vpn(httpd_t *h, int (*keep)(void *ctx, const char *profile, size_t len), void *ctx);
+/* GET /log: a plain-text diagnostics dump (the daemon's recent log and the
+ * kernel's) the owner can read or save and attach to a bug report, so a board
+ * that misbehaves need not be opened for a serial console. Behind the same
+ * login as the other pages. diag() writes at most cap-1 octets and a NUL into
+ * buf and returns the length; without this callback /log says so. */
+void httpd_on_diag(httpd_t *h, int (*diag)(void *ctx, char *buf, size_t cap), void *ctx);
 
 /* Register the Firmware page's helpers (copied; NULL takes them away).
  * Without `text` the page shows the version only; without `take` it offers

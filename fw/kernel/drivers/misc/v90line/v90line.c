@@ -120,7 +120,11 @@ struct v90line;
 
 struct v90port {
 	struct v90line *l;
-	int idx;			/* 0 = port 1: chip select, reset line, slot */
+	int idx;			/* 0 = port 1: the logical port (PCM slot, device name) */
+	int cs_idx;			/* which chip select / reset line this port drives; = idx,
+					   except a dual part's second channel shares the first's (0) */
+	int shares;			/* 1: the second channel of a dual part on a shared chip
+					   select -- do not reset the chip, follow the owner port */
 	struct miscdevice misc;
 	struct task_struct *thr;
 	ps_bus bus;
@@ -138,6 +142,8 @@ struct v90port {
 	int lin, want_lin;		/* 1: the codec runs 16-bit linear */
 	pump_meter meter;		/* received level, linear values */
 	int up;				/* the SLIC is initialised */
+	int slic_ready;			/* a shared second channel: set by the owner once it has
+					   brought this channel's SLIC up and in service */
 
 	/* bench access to the part, carried out by the port's thread */
 	struct mutex dbg_lock;
@@ -159,6 +165,7 @@ struct v90line {
 	void __iomem *tdm, *spi;
 	struct gpio_desc *cs[PORTS], *rst[PORTS];
 	spinlock_t lock;		/* the pumps and what goes with them */
+	int dual;			/* 1: one dual-channel part serves both ports on chip select 0 */
 	struct v90port port[PORTS];
 	s16 lin16[2][256];		/* codeword to linear, per law */
 
@@ -214,7 +221,7 @@ static uint8_t line_xfer(void *ctx, uint8_t out)
 	bad |= spi_wait_clear(l, S_GLOBAL, 0xffff);
 	writew(S_CON_MODE3_8, l->spi + S_CON);
 	writew(0, l->spi + S_IER);
-	gpiod_set_raw_value(l->cs[p->idx], 0);
+	gpiod_set_raw_value(l->cs[p->cs_idx], 0);
 	udelay(1);
 	if (!rd) {
 		writew(0, l->spi + S_FRM);
@@ -229,7 +236,7 @@ static uint8_t line_xfer(void *ctx, uint8_t out)
 		in = (u8)readw(l->spi + S_DAT);
 	}
 	udelay(1);
-	gpiod_set_raw_value(l->cs[p->idx], 1);
+	gpiod_set_raw_value(l->cs[p->cs_idx], 1);
 	udelay(2);
 	local_irq_restore(flags);
 	if (bad)
@@ -433,31 +440,91 @@ static void slic_debug(struct v90port *p)
 	complete(&p->dbg_done);
 }
 
-static int slic_up(struct v90port *p)
+/* record a channel's bring-up result: stats and a log line */
+static int chan_report(struct v90port *p, int r, const slic_info *info)
 {
-	slic_cfg cfg = { pcmmode_of(p->law, p->lin), (uint16_t)(16 * p->idx) };
-	slic_info info = { 0 };
-	int r;
-
-	gpiod_set_raw_value(p->l->rst[p->idx], 0);
-	msleep(10);
-	gpiod_set_raw_value(p->l->rst[p->idx], 1);
-	msleep(250);
-	p->spi_phase = 0;
-	r = slic_init(&p->bus, &cfg, &info);
 	p->inits++;
 	p->last_err = r;
-	p->last_stage = info.stage;
-	p->vbat_mv = info.vbat_mv;
-	if (r) {
+	p->last_stage = info->stage;
+	p->vbat_mv = info->vbat_mv;
+	if (r)
 		dev_err(p->l->dev, "port %d: SLIC start failed: %d at stage %d (id %02x, battery %ld mV)\n",
-			p->idx + 1, r, info.stage, info.id, info.vbat_mv);
-		gpiod_set_raw_value(p->l->rst[p->idx], 0);	/* converter off */
+			p->idx + 1, r, info->stage, info->id, info->vbat_mv);
+	else
+		dev_info(p->l->dev, "port %d: SLIC id %02x up, battery %ld mV, %s, %s receive\n", p->idx + 1,
+			 info->id, info->vbat_mv, p->law ? "A-law" : "mu-law", p->lin ? "linear" : "companded");
+	return r;
+}
+
+/* a single-channel part, straight through to in service (defer = 0) */
+static int chan_up(struct v90port *p, int defer)
+{
+	slic_cfg cfg = { pcmmode_of(p->law, p->lin), (uint16_t)(16 * p->idx), defer };
+	slic_info info = { 0 };
+
+	p->spi_phase = 0;
+	return chan_report(p, slic_init(&p->bus, &cfg, &info), &info);
+}
+
+/* Both channels of a dual part, in the chip's order: set up both, start both
+ * converters back to back, calibrate/configure both, then put both lines in
+ * service. Starting the converters together -- before either channel draws
+ * line current or runs its line calibrations -- keeps the second converter's
+ * start-up inrush from tripping the first off the shared VDC input. Returns
+ * the owner channel's result (channel 0); channel 1 comes up on its own
+ * result, flagged in p2->slic_ready for its thread. */
+static int dual_up(struct v90port *p, struct v90port *p2)
+{
+	slic_cfg c0 = { pcmmode_of(p->law, p->lin), 0, 1 };
+	slic_cfg c1 = { pcmmode_of(p2->law, p2->lin), 16, 1 };
+	slic_info i0 = { 0 }, i1 = { 0 };
+	int r0, r1;
+
+	WRITE_ONCE(p2->slic_ready, 0);
+	p->spi_phase = 0;
+	p2->spi_phase = 0;
+
+	r0 = slic_setup(&p->bus, &i0);
+	r1 = slic_setup(&p2->bus, &i1);
+	if (!r0) r0 = slic_converter(&p->bus, &i0);
+	if (!r1) r1 = slic_converter(&p2->bus, &i1);
+	if (!r0) r0 = slic_finish(&p->bus, &c0, &i0);
+	if (!r1) r1 = slic_finish(&p2->bus, &c1, &i1);
+	if (!r0) slic_service(&p->bus);
+	if (!r1) slic_service(&p2->bus);
+
+	chan_report(p, r0, &i0);
+	chan_report(p2, r1, &i1);
+	WRITE_ONCE(p2->slic_ready, r1 == 0);
+	return r0;
+}
+
+static int slic_up(struct v90port *p)
+{
+	struct v90line *l = p->l;
+	int r;
+
+	/* Reset the part. A shared second channel never does this: it would reset
+	 * the whole part and drop the other channel. (Only the owner reaches here
+	 * on a dual board; the shared channel is brought up inside this call.) */
+	if (!p->shares) {
+		gpiod_set_raw_value(l->rst[p->cs_idx], 0);
+		msleep(10);
+		gpiod_set_raw_value(l->rst[p->cs_idx], 1);
+		msleep(250);
+	}
+
+	if (l->dual && p->idx == 0) {
+		r = dual_up(p, &l->port[1]);
+		if (r)
+			gpiod_set_raw_value(l->rst[0], 0);	/* owner failed: converter off, retry */
 		return r;
 	}
-	dev_info(p->l->dev, "port %d: SLIC id %02x up, battery %ld mV, %s, %s receive\n", p->idx + 1, info.id,
-		 info.vbat_mv, p->law ? "A-law" : "mu-law", p->lin ? "linear" : "companded");
-	return 0;
+
+	r = chan_up(p, 0);					/* single channel, straight into service */
+	if (r && !p->shares)
+		gpiod_set_raw_value(l->rst[p->cs_idx], 0);	/* converter off (own chip only) */
+	return r;
 }
 
 /* Is there a part on this port's chip select? The one-port board (HT801)
@@ -468,14 +535,14 @@ static bool port_there(struct v90port *p)
 	int i, r = 0;
 
 	for (i = 0; i < 3 && !r; i++) {
-		gpiod_set_raw_value(p->l->rst[p->idx], 0);
+		gpiod_set_raw_value(p->l->rst[p->cs_idx], 0);
 		msleep(10);
-		gpiod_set_raw_value(p->l->rst[p->idx], 1);
+		gpiod_set_raw_value(p->l->rst[p->cs_idx], 1);
 		msleep(250);
 		p->spi_phase = 0;
 		r = slic_present(&p->bus);
 	}
-	gpiod_set_raw_value(p->l->rst[p->idx], 0);
+	gpiod_set_raw_value(p->l->rst[p->cs_idx], 0);
 	return r;
 }
 
@@ -487,7 +554,23 @@ static int line_thread(void *data)
 	while (!kthread_should_stop()) {
 		int h, want, want_lin;
 
-		if (!p->up) {
+		/* A shared second channel does not drive its own SLIC: the owner
+		 * (same chip) brings both channels up together, in the right order.
+		 * This thread only runs its own PCM/hook loop, mirroring the owner --
+		 * it comes up once the owner has readied this channel and falls with
+		 * the owner so it re-initialises if the owner resets the part. */
+		if (p->shares) {
+			if (!READ_ONCE(p->l->port[p->cs_idx].up) || !READ_ONCE(p->slic_ready)) {
+				p->up = 0;
+				msleep_interruptible(200);
+				continue;
+			}
+			if (!p->up) {
+				p->up = 1;
+				seen = run = 0;
+				pump_restart(p, 0);
+			}
+		} else if (!p->up) {
 			if (slic_up(p)) {
 				/* a shorted or missing line: try again, slowly */
 				fails++;
@@ -779,6 +862,7 @@ static int line_probe(struct platform_device *pdev)
 
 		p->l = l;
 		p->idx = i;
+		p->cs_idx = i;			/* its own chip select, unless the probe below shares one */
 		init_waitqueue_head(&p->wq);
 		mutex_init(&p->dbg_lock);
 		init_completion(&p->dbg_done);
@@ -801,10 +885,33 @@ static int line_probe(struct platform_device *pdev)
 		return r;
 	tdm_start(l);
 
+	/* Which board this is. The V1.x HT802 carries one dual-channel Si3226x:
+	 * port 1 is its channel 0 and port 2 its channel 1, both on chip select 0.
+	 * The other boards carry a single-channel part per port on its own chip
+	 * select. Bring the first part out of reset and read which it is; if it is
+	 * the dual part, point port 2 at its second channel on the same select. */
+	if (PORTS > 1) {
+		struct v90port *p0 = &l->port[0];
+
+		gpiod_set_raw_value(l->rst[0], 0);
+		msleep(10);
+		gpiod_set_raw_value(l->rst[0], 1);
+		msleep(250);
+		p0->spi_phase = 0;
+		if (slic_family(&p0->bus) == SLIC_FAM_3226X) {
+			l->dual = 1;
+			l->port[1].cs_idx = 0;
+			l->port[1].shares = 1;
+			l->port[1].bus.cid = 1;
+			dev_info(dev, "dual-channel SLIC on chip select 0: port 2 is its second channel\n");
+		}
+		gpiod_set_raw_value(l->rst[0], 0);	/* back to reset; the port thread starts it */
+	}
+
 	for (i = 0; i < PORTS; i++) {
 		struct v90port *p = &l->port[i];
 
-		if (i && !port_there(p)) {
+		if (i && !l->dual && !port_there(p)) {
 			dev_info(dev, "port %d: no SLIC answers, this is a one-port board\n", i + 1);
 			continue;
 		}

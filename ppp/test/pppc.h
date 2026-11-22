@@ -10,9 +10,11 @@
 #include "ppp_hdlc.h"
 #include "ppp_deflate.h"
 #include "ppp_mppc.h"
+#include "ppp_crypto.h"
 
 #define PPPC_AUTH_PAP   1u
 #define PPPC_AUTH_CHAP  2u
+#define PPPC_AUTH_MSCHAPV2 4u
 
 /* How the client speaks CCP (pppc_config_t.ccp):
  *   NONE     it has no CCP and Protocol-Rejects it
@@ -77,7 +79,7 @@ typedef struct pppc {
     int       auth_ok, auth_failed;
     uint8_t   pap_id;
     uint32_t  auth_timer;
-    uint8_t   chap_rsp[1 + 16];
+    uint8_t   chap_rsp[1 + 49];     /* MD5 is 1+16; MS-CHAPv2 is 1+49 */
     uint8_t   chap_id;
     int       chap_answered;
     char      auth_msg[64];

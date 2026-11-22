@@ -15,7 +15,7 @@ stock as before.
 | Board | Hardware | Part number | SoC | FXS ports | SLIC | Status |
 |---|---|---|---|---|---|---|
 | HT802 | V2.5A | `9610003725A` | DSPG DVF9918 | 2 | 2 × Si3217x | **Tested** |
-| HT802 | V1.6A | `9610003716A` | DVF99 (same device tree, expected) | 2 | 2 × Si3217x (expected) | **Accepted by the loader, untested** |
+| HT802 | V1.6A | `9610003716A` | DVF99 (same device tree) | 2 | 1 × Si3226x (Si32260, dual-channel) | **Tested** (issue #4) |
 | HT802 | other V2.x | not yet known | DVF9918 (expected) | 2 | 2 × Si3217x (expected) | **Expected, untested** |
 | HT801 | V1.0A | `9611003610A` | DVF99 (same device tree) | 1 | 1 × Si3217x (factory data) | **Accepted by the loader, untested** |
 | HT801 | V1.1C | `9610003611C` | DVF99 (same device tree) | 1 | 1 × Si3217x (factory data) | **Accepted by the loader, untested** |
@@ -271,6 +271,30 @@ Whoever can should make the first start on an HT801 from RAM
 (`fw/tools/ramboot.sh`, which writes nothing) with a serial console
 attached. Installing from the stock web page is expected to be safe as
 well, for the reason in point 1, with the network cable plugged in.
+
+## Flash chips and Ethernet PHYs
+
+HT80x boards ship with different parts for the 16 MiB QSPI flash and the
+Ethernet PHY. The loader and kernel now handle the ones the stock firmware
+does (its chip table and PHY set, studied from the vendor GPL kernel; our own
+clean code, `refs/qspi-chips.md`):
+
+- **Flash (16 MiB, the only size the A/B layout fits):** EON EN25QX128A
+  (the reference unit, tested), Winbond W25Q128FV (`ef4018`/`ef6018`),
+  GigaDevice GD25Q128 (`c84018`), Micron N25Q128 (`20ba18`). The loader reads
+  the JEDEC id and drives each one's quad mode; a flash chip it does not know
+  is handled like an unknown board (hands back to stock, no brick).
+- **Ethernet PHY:** the stock kernel uses the generic/fixed PHY path, so most
+  IEEE PHYs work without a chip-specific driver; we keep that and also build
+  the drivers for the parts seen in the field (Motorcomm YT8512H on the HT802
+  V2.5A, Micrel KSZ8081 on V1.x) plus a few common 10/100 parts.
+
+The **SLIC** is the exception: the vendor's line bring-up and its RAM patch are
+in closed userspace, not in the GPL, so v90d's SLIC support is written from the
+Silicon Labs Si3217x documentation and confirmed on the bench, per revision. It
+drives Si3217x **rev C** (patch-free, the reference unit). Another revision is a
+separate bring-up: it needs that revision's data and a unit to measure battery
+and ring voltage on, and it fails safe until then (the port stays dead, logged).
 
 ## Adding a board
 

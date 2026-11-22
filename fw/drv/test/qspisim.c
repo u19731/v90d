@@ -61,8 +61,11 @@ static void aux(qspisim *s, uint32_t cmd)
     case 0x05: if (type != 5) s->bad++; buf_put(s, R_FRD, 0, status(s)); break;
     case 0x06: if (type != 9) s->bad++; s->wel = 1; break;
     case 0x04: if (type != 9) s->bad++; s->wel = 0; break;
-    case 0x38: if (type != 9) s->bad++; s->qpi = 1; break;
-    case 0x01: case 0x31: s->status_writes++; (void)buf_get; s->wel = 0; break;
+    case 0x38: if (type != 9) s->bad++; if (!s->need_qe || (s->sr2 & 0x02)) s->qpi = 1; break;   /* QPI only once QE is set, on chips that need it */
+    case 0x35: if (type != 5 || !(cmd & (1ul << 13))) s->bad++; buf_put(s, R_FRD, 0, s->sr2); break;   /* read status register 2 */
+    case 0x50: if (type != 9) s->bad++; break;      /* volatile status write enable */
+    case 0xC0: if (type != 9 || !(cmd & (1ul << 14))) s->bad++; break;   /* set read parameters (in QPI) */
+    case 0x01: case 0x31: s->status_writes++; if (op == 0x31) s->sr2 = buf_get(s, R_FWD, 0); s->wel = 0; break;
     case 0x20:
         if (type != 0 || ((t >> 10) & 3) != 1 || (s->qpi && ((t >> 2) & 3) != 2)) { s->bad++; break; }
         if (!s->wel) { s->bad++; break; }
@@ -90,7 +93,7 @@ static void sim_wr(void *ctx, unsigned reg, uint32_t v)
 }
 static int window_reads(qspisim *s)
 {
-    return s->qpi ? (REG(s, R_RDTRSTP) == 0x0008362A && REG(s, R_RDCMD) == 0x0B) : 0;
+    return s->qpi ? ((REG(s, R_RDTRSTP) == 0x0008362A || REG(s, R_RDTRSTP) == 0x0008262A) && REG(s, R_RDCMD) == 0x0B) : 0;
 }
 static void sim_win_read(void *ctx, uint32_t off, uint8_t *buf, uint32_t n)
 {

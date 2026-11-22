@@ -290,7 +290,7 @@ int main(int argc, char **argv)
         printf("reg   0 = %02x\n", ps_rd(&b, PS_ID));
     } else if (!strcmp(argv[a], "init")) {
         /* our own bring-up of the port: reset, then drv/slic.c */
-        slic_cfg cfg = { SLIC_PCM_LINEAR, 0 }; slic_info info; int r;
+        slic_cfg cfg = { SLIC_PCM_LINEAR, 0, 0 }; slic_info info; int r;
         uint32_t bit = 1ul << (cs_pin == 16 ? 21 : 19);
         if (argc > a + 1) cfg.pcm_format = !strcmp(argv[a + 1], "alaw") ? SLIC_PCM_ALAW : !strcmp(argv[a + 1], "ulaw") ? SLIC_PCM_ULAW : SLIC_PCM_LINEAR;
         if (argc > a + 2) cfg.slot = (uint16_t)atoi(argv[a + 2]);

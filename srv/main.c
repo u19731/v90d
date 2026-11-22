@@ -53,6 +53,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/klog.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <netdb.h>
@@ -101,14 +102,72 @@ static const char *fw_tool = "/usr/sbin/v90nv";
 static const char *fw_update_cmd = "sh /etc/fwupdate.sh";    /* run as CMD VERSION to install an update */
 static pid_t    fw_pid;
 
+/* The recent daemon log, kept in memory so the owner can read it on the /log
+ * page without a serial console. The newest LOG_RING octets at most, oldest
+ * first; whole lines are dropped from the front to make room. */
+#define LOG_RING 8192
+static char   log_ring[LOG_RING];
+static size_t log_ring_len;
+static void log_ring_add(const char *s, size_t len)
+{
+    if (len > LOG_RING) { s += len - LOG_RING; len = LOG_RING; }     /* a line longer than the ring: keep its tail */
+    if (log_ring_len + len > LOG_RING) {
+        size_t need = log_ring_len + len - LOG_RING, drop = need;
+        char *nl = memchr(log_ring + need, '\n', log_ring_len - need);
+        if (nl) drop = (size_t)(nl + 1 - log_ring);                  /* drop whole lines, not a fragment */
+        memmove(log_ring, log_ring + drop, log_ring_len - drop);
+        log_ring_len -= drop;
+    }
+    memcpy(log_ring + log_ring_len, s, len);
+    log_ring_len += len;
+}
+
 void logf_(int level, const char *fmt, ...)
 {
     static const char *const tag[] = { "error", "warn", "info", "debug" };
-    va_list ap;
+    char line[512]; int p, q; va_list ap;
     if (level > log_level) return;
-    fprintf(stderr, "v90d %s: ", tag[level]);
-    va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
-    fputc('\n', stderr);
+    p = snprintf(line, sizeof line, "v90d %s: ", tag[level]);
+    if (p < 0) p = 0;
+    if (p > (int)sizeof line - 2) p = (int)sizeof line - 2;
+    va_start(ap, fmt);
+    q = vsnprintf(line + p, sizeof line - (size_t)p, fmt, ap);
+    va_end(ap);
+    if (q > 0) p += q;
+    if (p > (int)sizeof line - 2) p = (int)sizeof line - 2;          /* truncated: still leave room for \n and NUL */
+    line[p++] = '\n';
+    line[p] = 0;
+    fputs(line, stderr);
+    log_ring_add(line, (size_t)p);
+}
+
+/* GET /log (httpd_on_diag): the daemon's recent log and the kernel's, as plain
+ * text, for the owner to read or save and attach to a bug report. No config
+ * secrets are here (that is /config, redacted); any addresses in the log are
+ * the owner's own network. */
+static int diag_fill(void *ctx, char *buf, size_t cap)
+{
+    int n, k;
+    (void)ctx;
+    if (cap == 0) return 0;
+    n = snprintf(buf, cap, "v90d %s (built %s)\n\n=== daemon log ===\n", V90D_VERSION, __DATE__);
+    if (n < 0) n = 0;
+    if ((size_t)n > cap - 1) n = (int)cap - 1;
+    if (log_ring_len && (size_t)n + log_ring_len < cap) {
+        memcpy(buf + n, log_ring, log_ring_len);
+        n += (int)log_ring_len;
+    }
+    if ((size_t)n < cap - 1) {
+        int m = snprintf(buf + n, cap - (size_t)n, "\n=== kernel log ===\n");
+        if (m > 0) n += m;
+        if ((size_t)n > cap - 1) n = (int)cap - 1;
+    }
+    if ((size_t)n < cap - 1) {
+        k = klogctl(3 /* SYSLOG_ACTION_READ_ALL: the kernel's buffer, left in place */, buf + n, (int)(cap - 1 - (size_t)n));
+        if (k > 0) n += k;
+    }
+    buf[n] = 0;
+    return n;
 }
 
 const char *ip_str(uint32_t ip, char buf[16])
@@ -504,6 +563,7 @@ int main(int argc, char **argv)
     httpd_on_save(&H, on_save, NULL);
     httpd_on_vpn(&H, netsvc_on_vpn, NULL);
     httpd_on_bbs(&H, bbslink_rows, NULL);
+    httpd_on_diag(&H, diag_fill, NULL);
     { char r[48]; settings_set_vpn(netsvc_vpn_remote(r, sizeof r) ? r : NULL); }
     {
         static const httpd_fw_t fw = { V90D_VERSION " (built " __DATE__ ")", fw_text, fw_take, fw_install, NULL };

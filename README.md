@@ -62,6 +62,10 @@ the stock firmware stays in the box, one click away.
   Dreamcast switches and the Saturn matchmaking switch) when a port uses one
   of those services. The pages follow the box: both phone ports on an HT802,
   a single port on a one-port box.
+- A plain-text diagnostics page at **`/log`** (behind the same login): the
+  box's recent log and the kernel's, to read or save and attach to a bug
+  report, so a board that misbehaves need not be opened for a serial console.
+  Nothing leaves the box on its own; the owner chooses to share the file.
 - An optional update check (off by default, under System on the Settings
   page): once a day the box asks GitHub whether a newer release exists and,
   if so, offers it on the Firmware page with one-click install. It contacts

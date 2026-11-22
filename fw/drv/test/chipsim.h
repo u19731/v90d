@@ -12,6 +12,7 @@ struct chipsim {
     uint32_t ram[2048];
     int      phase;             /* 0 control, 1 address, 2 data */
     uint8_t  ctl, addr;
+    int      ch;                /* channel (CID) of the last control octet: 0, or 1 for a dual part's second channel */
     int      user, key;         /* user mode; place in the key sequence */
     int      busy_polls;        /* RAMSTAT says busy for this many reads after an access */
     int      busy, loaded;

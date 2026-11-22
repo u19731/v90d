@@ -10,11 +10,11 @@ ARM_CC  ?= $(wildcard $(CURDIR)/../toolchain/*/bin/arm-linux-gcc)
 QEMU    ?= qemu-arm-static
 
 INC     := -I. -I../test
-LIB_SRC := ppp_md5.c ppp_hdlc.c ppp_fsm.c ppp_deflate.c ppp_mppc.c ppp.c
-LIB_HDR := ppp_md5.h ppp_hdlc.h ppp_fsm.h ppp_deflate.h ppp_mppc.h ppp.h
+LIB_SRC := ppp_md5.c ppp_crypto.c ppp_hdlc.c ppp_fsm.c ppp_deflate.c ppp_mppc.c ppp.c
+LIB_HDR := ppp_md5.h ppp_crypto.h ppp_hdlc.h ppp_fsm.h ppp_deflate.h ppp_mppc.h ppp.h
 SUP_SRC := test/pppc.c
 SUP_HDR := test/pppc.h test/gen.h ../test/test.h
-TESTS   := test_md5 test_hdlc test_fsm test_ppp test_e2e test_deflate test_mppc test_ccp
+TESTS   := test_md5 test_crypto test_hdlc test_fsm test_ppp test_e2e test_deflate test_mppc test_ccp
 
 # under qemu the long sequences of test_deflate and test_mppc are cut short
 # (ARM_ARGS= for all of them; the other tests take no arguments)

@@ -186,6 +186,26 @@ static void chap_answer(const frame_t *ch, const char *user, const char *secret)
     push_cp(PPP_PROTO_CHAP, 2, ch->d[1], rsp, 17 + ul);
 }
 
+/* an MS-CHAPv2 Response to the server's Challenge ch (RFC 2759): a fixed
+ * peer challenge, then the NT-Response over the server's authenticator
+ * challenge, then the user name */
+static void mschap2_answer(const frame_t *ch, const char *user, const char *secret)
+{
+    static const uint8_t peer[16] = { 0x10,0x32,0x54,0x76,0x98,0xba,0xdc,0xfe,
+                                      0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef };
+    uint8_t rsp[1 + 49 + 64];
+    size_t ul = strlen(user);
+
+    rsp[0] = 49;
+    memcpy(rsp + 1, peer, 16);
+    memset(rsp + 1 + 16, 0, 8);
+    ppp_mschap2_nt_response(ch->d + 5, peer, (const uint8_t *)user, ul,
+                            (const uint8_t *)secret, strlen(secret), rsp + 1 + 24);
+    rsp[1 + 48] = 0;
+    memcpy(rsp + 50, user, ul);
+    push_cp(PPP_PROTO_CHAP, 2, ch->d[1], rsp, 50 + ul);
+}
+
 /* bring the link to the Network phase with CHAP as alice */
 static uint32_t to_network(const uint8_t *peer_opts, size_t n)
 {
@@ -565,6 +585,57 @@ static void test_chap(void)
     CHECK(find(PPP_PROTO_CHAP, 1) == NULL);
     CHECK(find(PPP_PROTO_LCP, PPP_TERM_REQ) != NULL);
     CHECK_EQ_I(status()->end_reason, PPP_END_AUTH_TIMEOUT);
+}
+
+static void test_mschap2(void)
+{
+    ppp_config_t c;
+    frame_t *ch, *f;
+
+    base_cfg(&c);
+    c.auth = PPP_AUTH_MSCHAPV2;
+    start(&c);
+    lcp_up(peer_lcp, sizeof peer_lcp);
+    CHECK_EQ_I(status()->phase, PPP_PHASE_AUTHENTICATE);
+    CHECK_EQ_I(status()->auth, PPP_AUTH_MSCHAPV2);
+    /* the challenge is a 16-octet value then our name, as for CHAP-MD5 */
+    ch = find(PPP_PROTO_CHAP, 1);
+    CHECK(ch != NULL);
+    if (!ch) return;
+    CHECK_EQ_I(ch->d[4], 16);
+
+    /* good credentials: authenticated, and Success carries "S=..." */
+    mschap2_answer(ch, "alice", "wonderland");
+    pull();
+    f = find(PPP_PROTO_CHAP, 3);
+    CHECK(f != NULL);
+    CHECK(f && f->n >= 4 + 42 && f->d[4] == 'S' && f->d[5] == '=');
+    CHECK_EQ_I(status()->phase, PPP_PHASE_NETWORK);
+    CHECK_EQ_I(status()->authenticated, 1);
+    CHECK(strcmp(status()->peer_name, "alice") == 0);
+    /* MPPE master keys were derived from the exchange */
+    CHECK_EQ_I(S.mppe_have, 1);
+
+    /* a repeated Response gets the same Success */
+    mschap2_answer(ch, "alice", "wonderland");
+    pull();
+    CHECK(find(PPP_PROTO_CHAP, 3) != NULL);
+
+    /* wrong secret: Failure "E=...", link terminated */
+    ppp_lower_down(&S);
+    ppp_lower_up(&S);
+    lcp_up(peer_lcp, sizeof peer_lcp);
+    ch = find(PPP_PROTO_CHAP, 1);
+    CHECK(ch != NULL);
+    if (!ch) return;
+    mschap2_answer(ch, "alice", "Wonderland");
+    pull();
+    f = find(PPP_PROTO_CHAP, 4);
+    CHECK(f && f->d[4] == 'E' && f->d[5] == '=');
+    CHECK(find(PPP_PROTO_CHAP, 3) == NULL);
+    CHECK_EQ_I(status()->phase, PPP_PHASE_TERMINATE);
+    CHECK_EQ_I(status()->end_reason, PPP_END_AUTH_FAILED);
+    CHECK_EQ_I(status()->authenticated, 0);
 }
 
 static void pap_request(uint8_t id, const char *user, const char *pass)
@@ -1276,6 +1347,7 @@ int main(void)
     test_peer_request();
     test_auth_negotiation();
     test_chap();
+    test_mschap2();
     test_pap();
     test_ipcp();
     test_data_and_lcp_codes();

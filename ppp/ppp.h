@@ -42,6 +42,7 @@
 #include "ppp_hdlc.h"
 #include "ppp_deflate.h"
 #include "ppp_mppc.h"
+#include "ppp_crypto.h"
 
 /* Transmit buffer size in octets (stuffed wire form). One worst-case IP
  * frame is 2 * (1500 + 6) + 2 = 3014 octets. */
@@ -84,7 +85,8 @@ typedef enum {
  * is used if the peer Naks CHAP. */
 #define PPP_AUTH_NONE  0u
 #define PPP_AUTH_PAP   1u
-#define PPP_AUTH_CHAP  2u
+#define PPP_AUTH_CHAP  2u          /* CHAP-MD5 (RFC 1994) */
+#define PPP_AUTH_MSCHAPV2 4u       /* MS-CHAPv2 (RFC 2759), for MPPE keys */
 
 /* why the link ended (or is ending) */
 typedef enum {
@@ -273,6 +275,11 @@ typedef struct ppp {
     uint32_t auth_timer;
     uint8_t  challenge[16];
     char     peer_name[PPP_NAME_MAX + 1];
+    /* MS-CHAPv2: the authenticator response to send on success, and the MPPE
+     * master start keys derived from it (RFC 3079), for CCP to key MPPE */
+    uint8_t  mschap2_resp[42];
+    uint8_t  mppe_send[16], mppe_recv[16];
+    uint8_t  mppe_have;
 
     /* IPCP */
     uint8_t  w_addr, ipcp_closing, addr_naks;

@@ -29,7 +29,7 @@
 #include "vpn.h"
 
 enum { HC_FREE = 0, HC_RECV, HC_BODY, HC_SEND, HC_LINGER };
-enum { V_ERROR = 0, V_HTML, V_JSON, V_CONFIG, V_HTML2, V_JSON2 /* port 2 */, V_CALLS, V_BBS };
+enum { V_ERROR = 0, V_HTML, V_JSON, V_CONFIG, V_HTML2, V_JSON2 /* port 2 */, V_CALLS, V_BBS, V_LOG };
 enum { M_GET, M_HEAD, M_POST, M_OTHER };
 
 #define CRED_MAX (6 + CFG_SECRET_MAX)   /* "admin:" and the longest password */
@@ -199,6 +199,12 @@ static void respond(httpd_t *h, httpd_conn_t *c, int code, int view, int head_on
         break;
     case V_CONFIG:
         finish(h, c, code, CT_TEXT, NULL, cfg_write(h->cfg, 0, body, HTTPD_BODY_MAX), head_only, now);
+        break;
+    case V_LOG:
+        if (h->diag)
+            finish(h, c, code, CT_TEXT, NULL, (size_t)h->diag(h->diag_ctx, body, HTTPD_BODY_MAX), head_only, now);
+        else
+            respond_text(h, c, code, NULL, "no diagnostics source\n", head_only, now);
         break;
     default:
         respond_text(h, c, code, code == 405 ? ALLOW_READ : NULL, NULL, head_only, now);
@@ -377,8 +383,10 @@ static int session_find(httpd_t *h, const char *p, size_t n, uint32_t now)
                 for (k = 0; k < SID_LEN; k++) diff |= (unsigned)(unsigned char)(ck.v[b + 4 + k] ^ h->sess[j].sid[k]);
                 if (!diff && h->sess[j].on) hit = j;
             }
-            if (hit >= 0) h->sess[hit].seen = now;
-            return hit;
+            /* keep looking on no match: a browser may send more than one
+             * sid cookie (a stale one from an earlier session alongside the
+             * live one), and the stale one often comes first */
+            if (hit >= 0) { h->sess[hit].seen = now; return hit; }
         }
     }
     return -1;
@@ -471,7 +479,13 @@ static void login_done(httpd_t *h, httpd_conn_t *c, uint32_t now)
     if (session_new(h, now)) { respond_text(h, c, 500, NULL, NULL, 0, now); return; }
     sb_init(&s, extra, sizeof extra);
     sb_puts(&s, "Location: /\r\nSet-Cookie: sid="); sb_puts(&s, h->sid);
-    sb_puts(&s, "; Path=/; HttpOnly; SameSite=Strict\r\n");
+    /* Lax, not Strict: the session cookie is carried by ordinary top-level
+     * navigations, including the server's own redirects between / and /login.
+     * With Strict some browsers (Firefox) withhold it on a redirected GET, so
+     * / -> /login -> / loops forever on a blank page. Lax still keeps the
+     * cookie off cross-site POSTs and subresources, and the Host/Origin check
+     * above guards the forms, so CSRF stays covered. */
+    sb_puts(&s, "; Path=/; HttpOnly; SameSite=Lax\r\n");
     sb_end(&s);
     respond_text(h, c, 303, extra, NULL, 0, now);
 }
@@ -911,6 +925,7 @@ static void handle(httpd_t *h, httpd_conn_t *c, size_t n, uint32_t now)
         view = V_BBS; h->bbs_query = q ? q + 1 : NULL; h->bbs_qlen = q ? ulen - plen - 1 : 0;
     }
     else if (plen == 7 && memcmp(uri, "/config", 7) == 0) view = V_CONFIG;
+    else if (plen == 4 && memcmp(uri, "/log", 4) == 0) view = V_LOG;
     else if (plen == 7 && memcmp(uri, "/logout", 7) == 0) {
         { int j = session_find(h, c->rx, n, now); if (j >= 0) h->sess[j].on = 0; }
         respond_text(h, c, 303, "Location: /\r\nSet-Cookie: sid=; Path=/; Max-Age=0\r\n", NULL, head_only, now);
@@ -922,7 +937,12 @@ static void handle(httpd_t *h, httpd_conn_t *c, size_t n, uint32_t now)
         return;
     }
     else { respond(h, c, 404, V_ERROR, head_only, now); return; }
-    if (view == V_CONFIG && !h->cfg->admin_password[0] && !host_is_address(c->rx, n)) {
+    /* /config and /log carry the box's own detail (settings, logs, dmesg).
+     * With no admin password set they are served only to a request that named
+     * the box by its address, not by a host name: a name can be pointed at the
+     * box by a hostile page (DNS rebinding) to read them from a browser on the
+     * LAN. */
+    if ((view == V_CONFIG || view == V_LOG) && !h->cfg->admin_password[0] && !host_is_address(c->rx, n)) {
         respond_text(h, c, 403, NULL, BY_ADDRESS, head_only, now);
         return;
     }
@@ -1008,6 +1028,12 @@ void httpd_on_save(httpd_t *h, int (*save)(void *ctx, const cfg_t *newcfg), void
 {
     h->save = save;
     h->save_ctx = ctx;
+}
+
+void httpd_on_diag(httpd_t *h, int (*diag)(void *ctx, char *buf, size_t cap), void *ctx)
+{
+    h->diag = diag;
+    h->diag_ctx = ctx;
 }
 
 static int set_nonblock_cloexec(int fd)

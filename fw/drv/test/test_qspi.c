@@ -31,8 +31,9 @@ static void test_init(void)
     CHECK_EQ_I(qspi_init(&Q, &IO), QSPI_OK); CHECK_EQ_I(S.qpi, 1); CHECK_EQ_I((int)S.bad, 0);
     CHECK_EQ_I(qspi_read(&Q, 0xFBE000, b, 16), QSPI_OK); CHECK(memcmp(b, S.mem + 0xFBE000, 16) == 0);
     CHECK_EQ_I((int)S.status_writes, 0);
-    /* another chip: hands off */
-    fresh(); S.id[0] = 0xC8; S.id[1] = 0x40;       /* the part the notes first assumed */
+    /* a chip we do not carry: hands off (0xC84018 GD25Q128 is now supported,
+     * so use a Macronix id the driver does not know) */
+    fresh(); S.id[0] = 0xC2; S.id[1] = 0x20;
     CHECK_EQ_I(qspi_init(&Q, &IO), QSPI_E_ID);
     CHECK_EQ_I(qspi_read(&Q, 0, b, 16), QSPI_E_ID);
     /* a controller that never becomes idle ends in an error, not a hang */

@@ -61,6 +61,31 @@ static const ram_val general2[] = {
     { R_CM_SPEEDUP_TIMER, 0x000F0000 }, { R_VCM_HYST, 0x00206280 },
 };
 
+/* Si3226x LCQCUK general parameters (refs/si3226x-facts.md and the Silicon
+ * Labs Si3226x LCQCUK constants, our own code): the same fields the Si3217x
+ * `general` table sets, at the shared rev-C RAM addresses, carrying the
+ * Si3226x values where they differ (line-driver power, battery hysteresis,
+ * ringing battery, and the DC-DC error, over/under-voltage and over-current
+ * thresholds). The VOV overhead and AC-ADC gain are left to the part's
+ * defaults and the ring preset, as the Si3226x general configuration does.
+ * Experimental, patch-free like the Si3217x; to be confirmed on hardware. */
+static const ram_val general_3226x[] = {
+    { R_P_TH_HVIC, 0x005B05B2 }, { R_COEF_P_HVIC, 0x07FEB800 }, { R_BAT_HYST, 0x000AD000 },
+    { R_VBATH_EXPECT, 0x03D70A20 },                 /* 60 V talk battery (same as Si3217x) */
+    { R_VBATR_EXPECT, 0x051EB82A },                 /* 80 V ringing battery */
+    { R_PWRSAVE_TIMER, 0x0FFF0000 }, { R_OFFHOOK_THRESH, 0x01999A00 },
+    { R_VBAT_TRACK_MIN, 0x00F00000 }, { R_VBAT_TRACK_MIN_RNG, 0x00F00000 },
+    { R_THERM_DBI, 0x00800000 }, { R_DCDC_VERR, 0x00F18900 }, { R_DCDC_VERR_HYST, 0x00809D80 },
+    { R_PD_UVLO, 0x00400000 }, { R_PD_OVLO, 0x00400000 }, { R_PD_OCLO, 0x00200000 }, { R_PD_SWDRV, 0x00400000 },
+    { R_DCDC_UVPOL, 0 }, { R_DCDC_RNGTYPE, 0x00200000 },
+    { R_DCDC_ANA_TOFF, 0x00300000 }, { R_DCDC_ANA_TONMIN, 0x00100000 }, { R_DCDC_ANA_TONMAX, 0x00FFC000 },
+    { R_DCDC_OITHRESH, 0x00800000 },
+    { R_DCDC_OITHRESH_LO, 0x00000000 }, { R_DCDC_OITHRESH_HI, 0x01C00000 },
+    { R_DCDC_OVTHRESH, 0x00500000 },
+    { R_DCDC_UVTHRESH, 0x00000000 }, { R_DCDC_UVHYST, 0x00500000 },
+    { R_SCALE_KAUDIO, 0x03A2E8BA },
+};
+
 /* Longitudinal balance trim. These are the results the stock firmware holds
  * for THIS unit (it reloads them instead of calibrating at every start); a
  * different unit should run the calibration instead. User-mode locations. */
@@ -171,7 +196,15 @@ static void converter_off(const ps_bus *b, uint32_t how)
  * If it is not within 5 V of the target after 2 s: stop. */
 static int converter_up(const ps_bus *b)
 {
-    uint32_t target; long v; uint8_t enhance; unsigned t;
+    uint32_t target, pd; long v; uint8_t enhance; unsigned t;
+
+    /* On a dual part (Si3226x) the two channels share one converter: whichever
+     * channel starts it first brings it up, and the other finds PD_DCDC bit 20
+     * already clear and leaves it running rather than re-arming it, which would
+     * disturb the channel already in service (refs/si3226x-facts.md section 4
+     * step 9). A part with a converter of its own per channel reads its own
+     * bit 20 still set here and starts it, so this is right for both. */
+    if (!ps_ram_rd(b, R_PD_DCDC, &pd) && !(pd & 0x100000)) return 0;
 
     ps_wr(b, PS_LINEFEED, 0);
     enhance = ps_rd(b, PS_ENHANCE);
@@ -209,6 +242,15 @@ void slic_shutdown(const ps_bus *b)
     ps_ram_wr(b, R_PD_DCDC, DCDC_OFF);
 }
 
+int slic_family(const ps_bus *b)
+{
+    uint8_t id = ps_rd(b, PS_ID);
+    if (id == 0xFF || !(id & 0x80)) return -1;
+    if ((id & 0x07) == 2) return SLIC_FAM_3217X;
+    if ((id & 0x07) == 3) return SLIC_FAM_3226X;
+    return -1;
+}
+
 int slic_present(const ps_bus *b)
 {
     uint8_t id = ps_rd(b, PS_ID), was;
@@ -224,14 +266,23 @@ int slic_present(const ps_bus *b)
     return ok;
 }
 
-int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
+/* Stages 1-2: identify the part, load the general parameters, calibrate the
+ * monitor ADC. The converter is left off and the line open. On a dual part
+ * this runs for both channels before either converter is started. */
+int slic_setup(const ps_bus *b, slic_info *info)
 {
     uint32_t w; int r;
 
     info->stage = 0; info->vbat_mv = 0;
     info->id = ps_rd(b, PS_ID);
-    /* a ProSLIC (bit 7), not a line-side device, revision C */
-    if (info->id == 0xFF || !(info->id & 0x80) || (info->id & 0x07) != 2) return SLIC_E_ID;
+    /* a ProSLIC (bit 7), not a line-side device; the revision code names the
+     * family at rev C: 2 = Si3217x, 3 = Si3226x (refs/si3226x-facts.md). They
+     * share the rev-C RAM map, so only the general values and a couple of
+     * bring-up steps differ. */
+    if (info->id == 0xFF || !(info->id & 0x80)) return SLIC_E_ID;
+    if ((info->id & 0x07) == 2) info->family = SLIC_FAM_3217X;
+    else if ((info->id & 0x07) == 3) info->family = SLIC_FAM_3226X;
+    else return SLIC_E_ID;
     ps_wr(b, PS_PCMRXLO, 0x5A);
     if (ps_rd(b, PS_PCMRXLO) != 0x5A) return SLIC_E_BUS;
     ps_wr(b, PS_PCMRXLO, 0);
@@ -242,7 +293,8 @@ int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
     info->stage = 1;
     ps_wr(b, PS_ENHANCE, 0x00);
     ps_wr(b, PS_AUTO, 0x2F);
-    if ((r = load(b, general, N(general))) != 0) return r;
+    if (info->family == SLIC_FAM_3226X) { if ((r = load(b, general_3226x, N(general_3226x))) != 0) return r; }
+    else if ((r = load(b, general, N(general))) != 0) return r;
     ps_wr(b, 68, (uint8_t)((ps_rd(b, 68) & 0xF9) | 0x60));    /* GPIO1/2: analogue sense inputs */
     ps_wr(b, PS_PDN, 0x80);                                    /* monitor ADC stays on with the line open */
     if ((r = load(b, general2, N(general2))) != 0) return r;
@@ -251,12 +303,30 @@ int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
     /* 2: monitor ADC offset calibration */
     info->stage = 2;
     if ((r = calibrate(b, 0x00, 0x00, 0x01, 10, 1000)) != 0) return r;
+    return SLIC_OK;
+}
 
-    /* 3: battery */
+/* Stage 3: start the battery converter. slic_setup must have run. On a dual
+ * part the converters of both channels are started back to back, between the
+ * setup of both and any line calibration, so the second converter's start-up
+ * inrush does not trip the first off the shared VDC input (the parts have a
+ * converter each, but they share the board's DC input). */
+int slic_converter(const ps_bus *b, slic_info *info)
+{
+    int r;
     info->stage = 3;
     r = converter_up(b);
     info->vbat_mv = slic_vbat_mv(b);
-    if (r) return r;
+    return r;
+}
+
+/* Stages 4-7: the remaining calibrations, line parameters, PCM, and (unless
+ * cfg->defer_service) the line in service. slic_setup and slic_converter must
+ * have run. On a dual part both lines are left open (defer_service) until both
+ * channels have finished, then slic_service() puts each in service. */
+int slic_finish(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
+{
+    int r;
 
     /* 4: the remaining calibrations */
     info->stage = 4;
@@ -268,7 +338,12 @@ int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
     /* 5: line parameters, with the line open */
     info->stage = 5;
     ps_wr(b, PS_LINEFEED, 0);
-    if ((r = load(b, balance, N(balance))) != 0 || (r = load(b, dcfeed, N(dcfeed))) != 0 ||
+    /* balance[] are the Si3217x reference unit's own longitudinal-balance
+     * calibration results, reloaded in place of calibrating. They do not
+     * apply to the Si3226x (a different part and board), which calibrates
+     * instead (the stage-5 calibrate below). */
+    if (info->family == SLIC_FAM_3217X && (r = load(b, balance, N(balance))) != 0) { converter_off(b, DCDC_OFF); return r; }
+    if ((r = load(b, dcfeed, N(dcfeed))) != 0 ||
         (r = load(b, impedance, N(impedance))) != 0) { converter_off(b, DCDC_OFF); return r; }
     ps_wr(b, 45, IMPEDANCE_RA);
     if ((r = load(b, impedance2, N(impedance2))) != 0) { converter_off(b, DCDC_OFF); return r; }
@@ -283,12 +358,24 @@ int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
     ps_wr(b, PS_PCMRXLO, (uint8_t)cfg->slot); ps_wr(b, PS_PCMRXHI, (uint8_t)((cfg->slot >> 8) & 0x03));
     ps_wr(b, PS_PCMMODE, (uint8_t)((cfg->pcm_format & 0x03) | 0x10));
 
-    /* 7: no interrupts (the driver polls the hook state), clear what is
-     * latched, and put the line in service */
+    /* 7: no interrupts (the driver polls the hook state), clear what is latched */
     info->stage = 7;
     ps_wr(b, PS_IRQEN1, 0); ps_wr(b, PS_IRQEN1 + 1, 0); ps_wr(b, PS_IRQEN1 + 2, 0); ps_wr(b, PS_IRQEN1 + 3, 0);
     (void)ps_rd(b, PS_IRQ1); (void)ps_rd(b, PS_IRQ1 + 1); (void)ps_rd(b, PS_IRQ1 + 2); (void)ps_rd(b, PS_IRQ1 + 3);
-    ps_wr(b, PS_LINEFEED, 1);
+    if (!cfg->defer_service) ps_wr(b, PS_LINEFEED, 1);
     info->vbat_mv = slic_vbat_mv(b);
     return SLIC_OK;
+}
+
+int slic_init(const ps_bus *b, const slic_cfg *cfg, slic_info *info)
+{
+    int r;
+    if ((r = slic_setup(b, info)) != 0) return r;
+    if ((r = slic_converter(b, info)) != 0) return r;
+    return slic_finish(b, cfg, info);
+}
+
+void slic_service(const ps_bus *b)
+{
+    ps_wr(b, PS_LINEFEED, 1);       /* forward active */
 }

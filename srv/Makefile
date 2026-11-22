@@ -17,7 +17,7 @@ include ../libv90m.mk
 # the daemon sees the library's public header only; the tests see its internals
 DAEMON_INC := -I. -I../tel -I../dce -I../cfg -I../ppp $(LIBV90M_INC)
 INC := -I. -I../tel -I../dce -I../dce/test -I../cfg -I../test -I../ppp -I../ppp/test $(LIBV90M_DEV_INC)
-PPP_SRC := $(addprefix ../ppp/,ppp_md5.c ppp_hdlc.c ppp_fsm.c ppp_deflate.c ppp_mppc.c ppp.c)
+PPP_SRC := $(addprefix ../ppp/,ppp_md5.c ppp_crypto.c ppp_hdlc.c ppp_fsm.c ppp_deflate.c ppp_mppc.c ppp.c)
 CFG_SRC := ../cfg/config.c ../cfg/status.c
 # everything portable that goes into the daemon
 # (the modem and V.42: libv90modem)

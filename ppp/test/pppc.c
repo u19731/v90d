@@ -109,8 +109,9 @@ static int l_rcr(ppp_fsm_t *f, const uint8_t *opts, size_t len,
         case 2: c->pend_accm = rd32(val); break;
         case 3: {
             unsigned asked = (vlen == 2 && val[0] == 0xc0 && val[1] == 0x23) ? PPPC_AUTH_PAP
-                           : (vlen == 3 && val[0] == 0xc2 && val[1] == 0x23 && val[2] == 5)
-                             ? PPPC_AUTH_CHAP : 0;
+                           : (vlen == 3 && val[0] == 0xc2 && val[1] == 0x23 && val[2] == 5) ? PPPC_AUTH_CHAP
+                           : (vlen == 3 && val[0] == 0xc2 && val[1] == 0x23 && val[2] == 0x81) ? PPPC_AUTH_MSCHAPV2
+                           : 0;
             if (asked && (asked & c->cfg.accept_auth)) {
                 c->pend_auth = asked;
             } else if (c->cfg.accept_auth & PPPC_AUTH_PAP) {
@@ -552,19 +553,33 @@ static void auth_input(pppc_t *c, uint16_t proto, const uint8_t *p, size_t n)
         } else if (p[0] == 3) {
             c->auth_failed = 1;
         }
-    } else if (proto == P_CHAP && c->auth == PPPC_AUTH_CHAP) {
+    } else if (proto == P_CHAP && (c->auth == PPPC_AUTH_CHAP || c->auth == PPPC_AUTH_MSCHAPV2)) {
         if (p[0] == 1 && len >= 5 && (size_t)p[4] + 5 <= len) {
-            ppp_md5_t m;
+            size_t ulen = strlen(c->cfg.user), plen = strlen(c->cfg.pass);
             c->chap_id = p[1];
-            c->chap_rsp[0] = 16;
-            ppp_md5_init(&m);
-            ppp_md5_update(&m, &p[1], 1);
-            ppp_md5_update(&m, (const uint8_t *)c->cfg.pass, strlen(c->cfg.pass));
-            ppp_md5_update(&m, p + 5, p[4]);
-            ppp_md5_final(&m, c->chap_rsp + 1);
-            c->chap_answered = 1;
-            c_cp(c, P_CHAP, 2, c->chap_id, c->chap_rsp, 17,
-                 (const uint8_t *)c->cfg.user, strlen(c->cfg.user));
+            if (c->auth == PPPC_AUTH_MSCHAPV2 && p[4] == 16) {
+                /* a fixed peer challenge is fine for a test; the NT-Response
+                 * is over the server's 16-octet authenticator challenge */
+                static const uint8_t peer[16] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 };
+                c->chap_rsp[0] = 49;
+                memcpy(c->chap_rsp + 1, peer, 16);
+                memset(c->chap_rsp + 1 + 16, 0, 8);
+                ppp_mschap2_nt_response(p + 5, peer, (const uint8_t *)c->cfg.user, ulen,
+                                        (const uint8_t *)c->cfg.pass, plen, c->chap_rsp + 1 + 24);
+                c->chap_rsp[1 + 48] = 0;
+                c->chap_answered = 1;
+                c_cp(c, P_CHAP, 2, c->chap_id, c->chap_rsp, 50, (const uint8_t *)c->cfg.user, ulen);
+            } else {
+                ppp_md5_t m;
+                c->chap_rsp[0] = 16;
+                ppp_md5_init(&m);
+                ppp_md5_update(&m, &p[1], 1);
+                ppp_md5_update(&m, (const uint8_t *)c->cfg.pass, plen);
+                ppp_md5_update(&m, p + 5, p[4]);
+                ppp_md5_final(&m, c->chap_rsp + 1);
+                c->chap_answered = 1;
+                c_cp(c, P_CHAP, 2, c->chap_id, c->chap_rsp, 17, (const uint8_t *)c->cfg.user, ulen);
+            }
             c->auth_timer = c->lcp.restart_ms;
         } else if (p[0] == 3 && !c->auth_ok) {
             size_t ml = len - 4 < sizeof c->auth_msg - 1 ? len - 4 : sizeof c->auth_msg - 1;

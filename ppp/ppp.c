@@ -30,6 +30,7 @@
 #define CHAP_SUCCESS     3
 #define CHAP_FAILURE     4
 #define CHAP_ALG_MD5     5
+#define CHAP_ALG_MSCHAP2 0x81
 
 /* CCP codes beyond the common seven (RFC 1962 section 3) and the options
  * we know (RFC 1962 section 4, RFC 2118 section 2, RFC 1979 section 3; 24
@@ -397,7 +398,9 @@ static void lcp_reset(ppp_fsm_t *f)
     p->magic = p->w_magic ? new_magic(p, 0) : 0;
     p->w_pfc = !p->cfg.no_pfc;
     p->w_acfc = !p->cfg.no_acfc;
-    if (p->cfg.auth & PPP_AUTH_CHAP)
+    if (p->cfg.auth & PPP_AUTH_MSCHAPV2)
+        p->w_auth = PPP_AUTH_MSCHAPV2;
+    else if (p->cfg.auth & PPP_AUTH_CHAP)
         p->w_auth = PPP_AUTH_CHAP;
     else if (p->cfg.auth & PPP_AUTH_PAP)
         p->w_auth = PPP_AUTH_PAP;
@@ -425,12 +428,12 @@ static size_t lcp_build_cr(ppp_fsm_t *f, uint8_t *o, size_t max)
         put32(o + n, p->accm);
         n += 4;
     }
-    if (p->w_auth == PPP_AUTH_CHAP) {
+    if (p->w_auth == PPP_AUTH_CHAP || p->w_auth == PPP_AUTH_MSCHAPV2) {
         o[n++] = LCP_OPT_AUTH;
         o[n++] = 5;
         o[n++] = (uint8_t)(PPP_PROTO_CHAP >> 8);
         o[n++] = (uint8_t)PPP_PROTO_CHAP;
-        o[n++] = CHAP_ALG_MD5;
+        o[n++] = p->w_auth == PPP_AUTH_MSCHAPV2 ? CHAP_ALG_MSCHAP2 : CHAP_ALG_MD5;
     } else if (p->w_auth == PPP_AUTH_PAP) {
         o[n++] = LCP_OPT_AUTH;
         o[n++] = 4;
@@ -684,6 +687,7 @@ static void lcp_down(ppp_fsm_t *f)
     network_stop(p);
     p->auth_proto = PPP_AUTH_NONE;
     p->auth_done = p->auth_ok = 0;
+    p->mppe_have = 0;
     /* back to the default framing */
     p->peer_mru = PPP_MAX_MRU;
     p->tx_accm = 0xffffffffu;
@@ -733,7 +737,8 @@ static int lcp_ext_code(ppp_fsm_t *f, uint8_t code, uint8_t id,
             /* it will not take compressed datagrams after all */
             ppp_fsm_close(&p->ccp);
         } else if ((proto == PPP_PROTO_PAP && p->auth_proto == PPP_AUTH_PAP) ||
-                   (proto == PPP_PROTO_CHAP && p->auth_proto == PPP_AUTH_CHAP)) {
+                   (proto == PPP_PROTO_CHAP && (p->auth_proto == PPP_AUTH_CHAP ||
+                                                p->auth_proto == PPP_AUTH_MSCHAPV2))) {
             if (!p->auth_ok)
                 request_close(p, PPP_END_AUTH_REFUSED);
         }
@@ -853,9 +858,10 @@ static void auth_start(ppp_t *p)
 {
     p->auth_timer = p->lcp.restart_ms;
     p->auth_tries = 1;
-    if (p->auth_proto == PPP_AUTH_CHAP) {
+    if (p->auth_proto == PPP_AUTH_CHAP || p->auth_proto == PPP_AUTH_MSCHAPV2) {
         /* RFC 1994 4.1: a new identifier and an unpredictable value for
-         * every new challenge */
+         * every new challenge (the 16-octet MS-CHAPv2 authenticator
+         * challenge is sent the same way) */
         p->auth_id++;
         nonce(p, p->challenge, 16);
         chap_send_challenge(p);
@@ -875,7 +881,7 @@ static void auth_tick(ppp_t *p, uint32_t ms)
             return;
         }
         p->auth_tries++;
-        if (p->auth_proto == PPP_AUTH_CHAP)
+        if (p->auth_proto == PPP_AUTH_CHAP || p->auth_proto == PPP_AUTH_MSCHAPV2)
             chap_send_challenge(p);   /* retransmission: same id and value */
     }
     p->auth_timer -= ms;
@@ -886,7 +892,19 @@ static void auth_reply(ppp_t *p, uint8_t id)
     const char *msg = p->auth_ok ? msg_ok : msg_bad;
     size_t ml = strlen(msg);
 
-    if (p->auth_proto == PPP_AUTH_CHAP) {
+    if (p->auth_proto == PPP_AUTH_MSCHAPV2) {
+        /* RFC 2759 section 5: Success carries "S=<auth response> M=<text>",
+         * Failure "E=<error> R=<retry> V=<version>". We do not offer a retry. */
+        if (p->auth_ok) {
+            uint8_t m[42 + 10];
+            memcpy(m, p->mschap2_resp, 42);
+            memcpy(m + 42, " M=Welcome", 10);
+            tx_cp(p, PPP_PROTO_CHAP, CHAP_SUCCESS, id, m, sizeof m, NULL, 0);
+        } else {
+            static const char e[] = "E=691 R=0 V=3";
+            tx_cp(p, PPP_PROTO_CHAP, CHAP_FAILURE, id, (const uint8_t *)e, sizeof e - 1, NULL, 0);
+        }
+    } else if (p->auth_proto == PPP_AUTH_CHAP) {
         tx_cp(p, PPP_PROTO_CHAP, p->auth_ok ? CHAP_SUCCESS : CHAP_FAILURE, id,
               (const uint8_t *)msg, ml, NULL, 0);
     } else {
@@ -970,7 +988,7 @@ static void chap_input(ppp_t *p, const uint8_t *pkt, size_t n)
 {
     int dl = cp_header(pkt, n);
     const uint8_t *d = pkt + 4, *user;
-    uint8_t secret[PPP_SECRET_MAX], want[16];
+    uint8_t secret[PPP_SECRET_MAX], want[24];
     size_t vs, ul;
     int sl, ok = 0;
 
@@ -993,7 +1011,23 @@ static void chap_input(ppp_t *p, const uint8_t *pkt, size_t n)
     ul = (size_t)dl - 1 - vs;
 
     sl = lookup_secret(p, user, ul, secret, sizeof secret);
-    if (sl >= 0 && vs == 16) {
+    if (p->auth_proto == PPP_AUTH_MSCHAPV2) {
+        /* RFC 2759: the 49-octet value is PeerChallenge[16], Reserved[8],
+         * NT-Response[24], Flags[1]. Our challenge is the authenticator
+         * challenge. Match the NT-Response, then build the authenticator
+         * response and derive the MPPE master keys. */
+        if (sl >= 0 && vs == 49) {
+            const uint8_t *peer = d + 1, *ntr = d + 1 + 24;
+            ppp_mschap2_nt_response(p->challenge, peer, user, ul, secret, (size_t)sl, want);
+            ok = same_bytes(want, ntr, 24);
+            if (ok) {
+                ppp_mschap2_auth_response(secret, (size_t)sl, ntr, peer, p->challenge,
+                                          user, ul, p->mschap2_resp);
+                ppp_mppe_master_keys(secret, (size_t)sl, ntr, 16, p->mppe_send, p->mppe_recv);
+                p->mppe_have = 1;
+            }
+        }
+    } else if (sl >= 0 && vs == 16) {
         /* RFC 1994 4.1: MD5 over identifier, secret, challenge value */
         ppp_md5_t m;
         ppp_md5_init(&m);
@@ -1696,10 +1730,12 @@ static void handle_frame(ppp_t *p)
         return;
     }
     if (proto == PPP_PROTO_PAP || proto == PPP_PROTO_CHAP) {
-        unsigned which = proto == PPP_PROTO_PAP ? PPP_AUTH_PAP : PPP_AUTH_CHAP;
+        int match = proto == PPP_PROTO_PAP
+                        ? p->auth_proto == PPP_AUTH_PAP
+                        : (p->auth_proto == PPP_AUTH_CHAP || p->auth_proto == PPP_AUTH_MSCHAPV2);
 
-        if (which == p->auth_proto) {
-            if (which == PPP_AUTH_PAP)
+        if (match) {
+            if (proto == PPP_PROTO_PAP)
                 pap_input(p, info, n);
             else
                 chap_input(p, info, n);

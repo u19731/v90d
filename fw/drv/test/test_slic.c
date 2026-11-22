@@ -55,7 +55,7 @@ static void fresh(void)
     C.ram[1538] = 0x900000; C.ram[1575] = 0x1EC3FDBC; C.ram[767] = 0x03958100;
 }
 
-static const slic_cfg CFG = { SLIC_PCM_LINEAR, 0 };
+static const slic_cfg CFG = { SLIC_PCM_LINEAR, 0, 0 };
 
 static void test_healthy(void)
 {
@@ -95,7 +95,7 @@ static void test_healthy(void)
 
 static void test_companded_second_port(void)
 {
-    slic_info i; slic_cfg c = { SLIC_PCM_ULAW, 16 };
+    slic_info i; slic_cfg c = { SLIC_PCM_ULAW, 16, 0 };
     fresh();
     CHECK_EQ_I(slic_init(&B, &c, &i), SLIC_OK);
     CHECK_EQ_I(C.reg[11], 0x11);
@@ -114,6 +114,71 @@ static void test_wrong_part(void)
     fresh(); C.reg[0] = 0xFF;                       /* nothing there */
     CHECK_EQ_I(slic_init(&B, &CFG, &i), SLIC_E_ID);
     CHECK(C.frames < 40);
+}
+
+/* a Si3226x rev C (ID revision code 3, e.g. 0xB3): accepted as its own family
+ * and brought up with the Si3226x general values, no Si3217x balance reload */
+static void test_si3226x(void)
+{
+    slic_info i;
+    fresh(); C.reg[0] = 0xB3;
+    CHECK_EQ_I(slic_init(&B, &CFG, &i), SLIC_OK);
+    CHECK_EQ_I(i.id, 0xB3);
+    CHECK_EQ_I(i.family, SLIC_FAM_3226X);
+    CHECK(i.vbat_mv > 55000 && i.vbat_mv < 62000);          /* talk battery up */
+    CHECK_EQ_I((long)C.ram[1547], 0x00500000);              /* DCDC_OVTHRESH: the Si3226x value, not the Si3217x 0x01300000 */
+    CHECK_EQ_I((long)C.ram[768], 0x051EB82A);               /* VBATR_EXPECT: 80 V, the Si3226x value */
+}
+
+/* With defer_service the line is left open at the end of slic_init (so both
+ * channels of a dual part can be calibrated before either is in service), and
+ * slic_service() puts it in service afterwards. */
+static void test_deferred_service(void)
+{
+    slic_cfg c = { SLIC_PCM_LINEAR, 0, 1 };
+    slic_info i;
+    fresh();
+    CHECK_EQ_I(slic_init(&B, &c, &i), SLIC_OK);
+    CHECK(i.vbat_mv > 55000 && i.vbat_mv < 62000);      /* converter + calibration done */
+    CHECK_EQ_I(C.reg[30], 0);                           /* LINEFEED: line still open */
+    slic_service(&B);
+    CHECK_EQ_I(C.reg[30], 1);                           /* now forward active */
+}
+
+/* The second channel of a dual part is addressed with the CID in the control
+ * octet (channel 1 = 0x30 write / 0x70 read); the bus must reach it with no
+ * protocol error. */
+static void test_second_channel_cid(void)
+{
+    fresh();
+    B.cid = 1;
+    ps_wr(&B, PS_PCMRXLO, 0x5A);
+    CHECK_EQ_I(C.ch, 1);
+    CHECK_EQ_I(ps_rd(&B, PS_PCMRXLO), 0x5A);
+    CHECK_EQ_I(C.ch, 1);
+    CHECK_EQ_I((int)C.bad, 0);
+    B.cid = 0;
+    ps_wr(&B, PS_PCMRXLO, 0xA5);
+    CHECK_EQ_I(C.ch, 0);
+}
+
+/* Bringing up channel 1 of a dual part while its shared converter is already
+ * running (channel 0 started it): slic_init must leave the converter alone,
+ * not re-arm it, and still bring the channel into service. */
+static void test_second_channel_shares_converter(void)
+{
+    slic_info i;
+    fresh(); C.reg[0] = 0xB3; B.cid = 1;
+    C.ram[1538] = 0x400000;             /* PD_DCDC: converter already running (bit 20 clear) */
+    C.ram[3] = MV(59000);               /* battery already up */
+    M.running = 1; M.conv_ms = 1000;    /* so the model holds the battery there through the cal sleeps */
+    CHECK_EQ_I(slic_init(&B, &CFG, &i), SLIC_OK);
+    CHECK_EQ_I(i.family, SLIC_FAM_3226X);
+    CHECK(i.vbat_mv > 55000 && i.vbat_mv < 62000);
+    CHECK_EQ_I(M.linefeed_at_start, -1);        /* never (re)started the converter */
+    CHECK_EQ_I((long)C.ram[1538], 0x400000);    /* left running, not re-armed */
+    CHECK_EQ_I((int)C.bad, 0);
+    B.cid = 0;
 }
 
 /* an empty footprint: the bus floats and reads whatever it was left at */
@@ -226,6 +291,10 @@ int main(void)
     test_healthy();
     test_companded_second_port();
     test_wrong_part();
+    test_si3226x();
+    test_deferred_service();
+    test_second_channel_cid();
+    test_second_channel_shares_converter();
     test_present();
     test_dead_ram();
     test_short_circuit();
