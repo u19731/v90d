@@ -15,6 +15,7 @@ stock as before.
 | Board | Hardware | Part number | SoC | FXS ports | SLIC | Status |
 |---|---|---|---|---|---|---|
 | HT802 | V2.5A | `9610003725A` | DSPG DVF9918 | 2 | 2 × Si3217x | **Tested** |
+| HT802 | V1.6A | `9610003716A` | DVF99 (same device tree, expected) | 2 | 2 × Si3217x (expected) | **Accepted by the loader, untested** |
 | HT802 | other V2.x | not yet known | DVF9918 (expected) | 2 | 2 × Si3217x (expected) | **Expected, untested** |
 | HT801 | V1.0A | `9611003610A` | DVF99 (same device tree) | 1 | 1 × Si3217x (factory data) | **Accepted by the loader, untested** |
 | HT801 | V1.1C | `9610003611C` | DVF99 (same device tree) | 1 | 1 × Si3217x (factory data) | **Accepted by the loader, untested** |
